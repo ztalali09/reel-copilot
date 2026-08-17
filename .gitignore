@@ -1,0 +1,13 @@
+node_modules/
+dist/
+.env
+*.log
+
+# Local run artifacts: SQLite store, extracted media.
+data/
+tmp/
+
+# Brand context is private by design: it carries positioning and internal figures.
+# Each user supplies their own, see context/README.md.
+context/*
+!context/README.md
