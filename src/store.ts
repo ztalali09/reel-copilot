@@ -26,6 +26,26 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS reels_author_idx ON reels (author, judged_at);
 `);
 
+// Added after the first deployments, so they go on as migrations rather than in the
+// CREATE above: an existing volume already holds a table without them.
+for (const column of [
+  "cible TEXT",
+  "douleur TEXT",
+  "angle TEXT",
+  "caption TEXT",
+  // Filled by /mesure, once the comment has had time to collect reactions.
+  "likes INTEGER",
+  "replies INTEGER",
+  "replies_text TEXT",
+  "measured_at TEXT",
+]) {
+  try {
+    db.exec(`ALTER TABLE reels ADD COLUMN ${column}`);
+  } catch {
+    // Already present.
+  }
+}
+
 export interface PastJudgement {
   shortcode: string;
   author: string | null;
@@ -50,11 +70,13 @@ export function record(
   url: string,
   author: string | null,
   judgement: Judgement,
+  caption = "",
 ): void {
   db.prepare(
     `INSERT OR REPLACE INTO reels
-       (shortcode, url, author, verdict, score, liked, reposted, comment)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+       (shortcode, url, author, verdict, score, liked, reposted, comment,
+        cible, douleur, angle, caption)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     shortcode,
     url,
@@ -64,7 +86,92 @@ export function record(
     judgement.like ? 1 : 0,
     judgement.republier ? 1 : 0,
     judgement.commentaire,
+    judgement.cible,
+    judgement.douleur,
+    judgement.angle,
+    caption,
   );
+}
+
+export interface CommentedReel {
+  shortcode: string;
+  url: string;
+  author: string | null;
+  comment: string;
+  judgedAt: string;
+}
+
+/**
+ * Reels we advised commenting on and have not measured recently.
+ *
+ * Measuring costs one scrape each, so leave a few days: reactions need time to arrive,
+ * and re-checking yesterday's comment tells you nothing.
+ */
+export function listToMeasure(limit = 25): CommentedReel[] {
+  return db
+    .prepare(
+      `SELECT shortcode, url, author, comment, judged_at AS judgedAt
+       FROM reels
+       WHERE verdict = 'COMMENTER'
+         AND comment <> ''
+         AND shortcode NOT LIKE 'local-%' AND shortcode NOT LIKE 'shot-%'
+         AND julianday('now') - julianday(judged_at) >= 2
+         AND (measured_at IS NULL OR julianday('now') - julianday(measured_at) >= 5)
+       ORDER BY judged_at DESC
+       LIMIT ?`,
+    )
+    .all(limit) as CommentedReel[];
+}
+
+export function recordMeasurement(
+  shortcode: string,
+  likes: number,
+  replies: number,
+  repliesText: string,
+): void {
+  db.prepare(
+    `UPDATE reels
+     SET likes = ?, replies = ?, replies_text = ?, measured_at = datetime('now')
+     WHERE shortcode = ?`,
+  ).run(likes, replies, repliesText, shortcode);
+}
+
+export interface Reference {
+  shortcode: string;
+  url: string;
+  author: string | null;
+  caption: string | null;
+  cible: string | null;
+  douleur: string | null;
+  angle: string | null;
+  comment: string;
+  likes: number;
+  replies: number;
+  repliesText: string | null;
+  judgedAt: string;
+}
+
+/**
+ * The library of what worked, ranked by conversation started rather than by popularity.
+ *
+ * A comment with 150 likes and no reply is applause. One with 30 likes and three replies
+ * from people describing their own situation is a conversation, and that is what this is
+ * for — so replies weigh an order of magnitude more.
+ */
+export function listReferences(limit = 15): Reference[] {
+  return db
+    .prepare(
+      `SELECT shortcode, url, author, caption, cible, douleur, angle, comment,
+              COALESCE(likes, 0) AS likes,
+              COALESCE(replies, 0) AS replies,
+              replies_text AS repliesText,
+              judged_at AS judgedAt
+       FROM reels
+       WHERE measured_at IS NOT NULL AND (COALESCE(likes, 0) + COALESCE(replies, 0)) > 0
+       ORDER BY (COALESCE(replies, 0) * 10 + COALESCE(likes, 0)) DESC
+       LIMIT ?`,
+    )
+    .all(limit) as Reference[];
 }
 
 /**

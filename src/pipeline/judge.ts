@@ -99,9 +99,19 @@ FORME DU COMMENTAIRE — ces regles sont dures
   auteur n'a pas formulee. N'explique pas a l'audience ce qu'elle devrait faire : elle
   n'a rien demande, et le ton donneur de lecons tue le commentaire.
 - N'ouvre jamais par un acquiescement : "Exactement", "Tellement vrai", "C'est ca",
-  "Carrement", "100%". Ces ouvertures pourraient preceder n'importe quel commentaire sous
-  n'importe quelle video : elles prouvent a elles seules que le commentaire est generique.
+  "Carrement", "100%", "Bonne question", "Excellente question", "Tout a fait". Ces
+  ouvertures pourraient preceder n'importe quel commentaire sous n'importe quelle video :
+  elles prouvent a elles seules que le commentaire est generique. Cette interdiction vaut
+  AUSSI pour les reponses aux prospects — entre directement dans le fond.
 - Pas de flatterie ajoutee ("bien joue", "bravo", "trop fort"). Elle ne dit rien et se voit.
+- EMOJIS : zero ou un, jamais deux. Le texte doit se tenir entierement sans lui ; si
+  l'emoji porte le sens, la phrase est ratee. Le seul autorise est 👀, et pas a chaque
+  fois. INTERDITS, parce qu'ils datent celui qui ecrit face a une audience jeune :
+  😂 (lu comme "vieux millennial"), 👍 et 🙂 (lus comme passifs-agressifs), ❤️, 👏, ✅,
+  🔥 en rafale. N'essaie pas non plus d'imiter les codes des plus jeunes (💀, 😭) : une
+  marque qui force le registre de son audience se grille plus vite qu'une marque sobre.
+  Dans les REPONSES AUX PROSPECTS : aucun emoji. On y repond a une question concrete, et
+  c'est le registre ou la credibilite compte le plus.
 - Pas de formule creuse ("c'est la cle", "le secret", "ca change tout", "il faut savoir").
 - Le commentaire doit pouvoir se lire comme celui d'une personne qui a regarde la video,
   pas d'une marque qui a compris une opportunite.
@@ -133,6 +143,17 @@ On te donne les commentaires deja publies sous le Reel. Ils servent a deux chose
    principal. Pas de "Courage !", pas de "Bonne chance", pas de banalite encourageante :
    ces phrases ne disent rien et se voient. Si tu n'as rien d'utile a repondre a quelqu'un,
    ne le retiens pas comme prospect.
+
+   IMPORTANT : la reponse sera publiee comme COMMENTAIRE DE PREMIER NIVEAU precede du
+   pseudo, pas comme reponse imbriquee dans le fil. Elle doit donc se comprendre SEULE,
+   par quelqu'un qui n'a pas le commentaire d'origine sous les yeux. Rappelle brievement
+   de quoi il s'agit plutot que d'ecrire "oui, exactement" ou "ca depend" dans le vide.
+   N'ecris pas le pseudo toi-meme dans le champ 'reponse' : il est ajoute automatiquement.
+
+   LE PREMIER MOT DOIT DEJA APPORTER L'INFORMATION. N'evalue jamais le commentaire auquel
+   tu reponds — ni sa qualite ("bonne question", "c'est une excellente question"), ni
+   l'emotion qu'il exprime ("c'est frustrant", "je comprends") : reponds-y. Ces phrases
+   d'ouverture occupent la place utile et signalent qu'on n'a rien a dire.
 
    Laisse 'prospects' vide si personne ne s'y prete. N'invente jamais un pseudo, et ne
    retiens jamais le compte de la marque elle-meme.
@@ -198,6 +219,10 @@ score a 70, dis-le dans 'pourquoi', et refuse plutot que d'inventer un contenu p
    le contenu.
 `.trim();
 
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 let brandContext: string | null = null;
 
 async function loadBrandContext(): Promise<string> {
@@ -228,6 +253,52 @@ async function loadBrandContext(): Promise<string> {
     );
   }
   return brandContext;
+}
+
+/**
+ * Rewrites an approved comment under a new instruction.
+ *
+ * Reuses the same brand context and the same form rules, so a reformulation cannot drift
+ * into something the brief forbids. Only the comment is regenerated: the verdict, the
+ * score and the prospects were not what the user disagreed with.
+ */
+export async function refine(
+  metadata: ReelMetadata,
+  transcript: Transcript,
+  previous: string,
+  instruction: string,
+): Promise<string> {
+  const ai = new GoogleGenAI({ apiKey: config.gemini.apiKey });
+  const brand = await loadBrandContext();
+
+  const prompt = [
+    INSTRUCTIONS,
+    "",
+    "Tu as deja propose ce commentaire :",
+    `"${previous}"`,
+    "",
+    `L'utilisateur demande : ${instruction}`,
+    "",
+    "Reecris-le. Reponds UNIQUEMENT avec le nouveau commentaire, sans guillemets, sans",
+    "explication, sans preambule. Il doit rester conforme a toutes les regles de forme :",
+    "une phrase, une observation, aucune ouverture d'acquiescement, aucune formule creuse.",
+    "Ne reprends pas la formulation precedente : produis une vraie alternative.",
+    "",
+    "LE REEL :",
+    `LEGENDE : ${metadata.caption || "(aucune)"}`,
+    `TRANSCRIPTION : ${transcript.text || "(aucune parole)"}`,
+  ].join("\n");
+
+  const response = await ai.models.generateContent({
+    model: "gemini-2.5-flash",
+    contents: [{ role: "user", parts: [{ text: brand }, { text: prompt }] }],
+    // Higher than the judgement: the point of asking again is to get something different.
+    config: { temperature: 0.9 },
+  });
+
+  const text = response.text?.trim();
+  if (!text) throw new Error("Gemini returned an empty reformulation");
+  return text.replace(/^["'«»\s]+|["'«»\s]+$/g, "");
 }
 
 export async function judge(
@@ -306,6 +377,18 @@ export async function judge(
 
   // The schema cannot express "empty comment when refusing", so enforce it here.
   if (parsed.verdict === "NE_PAS_COMMENTER") parsed.commentaire = "";
+
+  // The handle is prepended when the message is built. The model keeps writing it anyway,
+  // which would produce "@manon_rh manon_rh : ..." — strip it rather than fight the prompt.
+  parsed.prospects = parsed.prospects.map((p) => {
+    const pseudo = p.pseudo.replace(/^@/, "");
+    const reponse = p.reponse
+      .replace(new RegExp(`^@?${escapeRegExp(pseudo)}\\s*[:,-]?\\s*`, "i"), "")
+      .trim();
+    // Stripping the handle often leaves a lowercase first letter, and the model is
+    // inconsistent about it anyway. Uppercase it so pasted replies read the same way.
+    return { ...p, pseudo, reponse: reponse.charAt(0).toUpperCase() + reponse.slice(1) };
+  });
 
   return parsed;
 }

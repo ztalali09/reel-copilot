@@ -35,10 +35,10 @@ const SCENARIOS: Scenario[] = [
     text: "J'ai envoye 80 candidatures pour mon alternance en comptabilite depuis juin. Aucune reponse. Meme pas un refus. Je commence a me demander si mon CV part directement a la poubelle. Franchement je sais plus quoi faire.",
     ageHours: 3,
     comments: [
-      { author: "lea.b_", text: "Moi c'est pareil avec mon stage, j'ai rien depuis mars", likeCount: 4 },
-      { author: "hugo.dev", text: "Courage 🔥🔥", likeCount: 0 },
-      { author: "manon_rh", text: "Tu as postule que sur les offres ou tu as contacte des boites directement ?", likeCount: 7 },
-      { author: "kev.2001", text: "Le probleme c'est le CV faut le refaire", likeCount: 2 },
+      { author: "lea.b_", text: "Moi c'est pareil avec mon stage, j'ai rien depuis mars", likeCount: 4, replyCount: 0, replies: [] },
+      { author: "hugo.dev", text: "Courage 🔥🔥", likeCount: 0, replyCount: 0, replies: [] },
+      { author: "manon_rh", text: "Tu as postule que sur les offres ou tu as contacte des boites directement ?", likeCount: 7, replyCount: 0, replies: [] },
+      { author: "kev.2001", text: "Le probleme c'est le CV faut le refaire", likeCount: 2, replyCount: 0, replies: [] },
     ],
   },
   {
@@ -50,7 +50,7 @@ const SCENARIOS: Scenario[] = [
     text: "J'ai arrete de postuler aux annonces. J'ai fait une liste de vingt entreprises dans ma ville qui font mon metier, j'ai trouve le mail du responsable et je leur ai ecrit directement. Trois reponses, deux entretiens, une signature.",
     ageHours: 144,
     comments: [
-      { author: "sofia.k", text: "Comment tu trouves les mails des responsables ?", likeCount: 12 },
+      { author: "sofia.k", text: "Comment tu trouves les mails des responsables ?", likeCount: 12, replyCount: 0, replies: [] },
     ],
   },
   {

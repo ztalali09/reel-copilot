@@ -1,4 +1,4 @@
-import { Bot, GrammyError, type Context, type Filter } from "grammy";
+import { Bot, GrammyError, InlineKeyboard, type Context, type Filter } from "grammy";
 import { createWriteStream } from "node:fs";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -7,7 +7,7 @@ import { Readable } from "node:stream";
 import { pipeline as streamPipeline } from "node:stream/promises";
 import { config } from "./config.js";
 import { extractMedia, isFfmpegAvailable } from "./pipeline/audio.js";
-import { judge, type Judgement } from "./pipeline/judge.js";
+import { judge, refine, type Judgement } from "./pipeline/judge.js";
 import {
   ageInHours,
   commentDensity,
@@ -16,9 +16,17 @@ import {
   scrapeReel,
   type ReelMetadata,
 } from "./pipeline/scrape.js";
-import { transcribe } from "./pipeline/transcribe.js";
+import { transcribe, type Transcript } from "./pipeline/transcribe.js";
 import { Queue } from "./queue.js";
-import { commentsForAuthorToday, findJudged, record, todayStats } from "./store.js";
+import {
+  commentsForAuthorToday,
+  findJudged,
+  listReferences,
+  listToMeasure,
+  record,
+  recordMeasurement,
+  todayStats,
+} from "./store.js";
 
 const bot = new Bot(config.telegram.token);
 
@@ -29,12 +37,61 @@ const queue = new Queue(QUEUE_CONCURRENCY);
 // Telegram throttles message edits; 3 seconds keeps the counter alive without hitting it.
 const EDIT_THROTTLE_MS = 3_000;
 
+// Each measurement is one scrape, so cap a manual run rather than sweeping everything.
+const MEASURE_BATCH = 15;
+
+const REFINE_KEYBOARD = new InlineKeyboard()
+  .text("Plus court", "refine:court")
+  .text("Plus direct", "refine:direct")
+  .row()
+  .text("Autre angle", "refine:angle");
+
+const REFINE_INSTRUCTIONS: Record<string, string> = {
+  court: "raccourcis-le nettement, garde l'idee mais coupe tout ce qui n'est pas essentiel",
+  direct: "va droit au but, retire les precautions et les formules d'attenuation",
+  angle: "change completement d'angle, pars d'un autre aspect du Reel",
+};
+
+/** Context of recently proposed comments, so a reformulation can be regenerated. */
+const pending = new Map<number, { metadata: ReelMetadata; transcript: Transcript; comment: string }>();
+const PENDING_LIMIT = 200;
+
 type TextContext = Filter<Context, "message:text">;
 
 // Single-user bot. Anything from another account is dropped before it costs a credit.
 bot.use(async (ctx, next) => {
   if (ctx.from?.id !== config.telegram.ownerId) return;
   await next();
+});
+
+bot.callbackQuery(/^refine:(.+)$/, async (ctx) => {
+  const key = ctx.match[1] ?? "";
+  const instruction = REFINE_INSTRUCTIONS[key];
+  const messageId = ctx.callbackQuery.message?.message_id;
+  const context = messageId ? pending.get(messageId) : undefined;
+
+  if (!instruction || !context) {
+    return ctx.answerCallbackQuery("Ce commentaire est trop ancien, renvoie le Reel.");
+  }
+
+  await ctx.answerCallbackQuery("Je reecris...");
+  try {
+    const rewritten = await refine(
+      context.metadata,
+      context.transcript,
+      context.comment,
+      instruction,
+    );
+
+    const sent = await ctx.reply(`<code>${escapeHtml(rewritten)}</code>`, {
+      parse_mode: "HTML",
+      reply_markup: REFINE_KEYBOARD,
+    });
+    // Chain from the new version, so asking twice keeps refining rather than looping back.
+    pending.set(sent.message_id, { ...context, comment: rewritten });
+  } catch (error) {
+    await ctx.reply(`Echec : ${error instanceof Error ? error.message : String(error)}`);
+  }
 });
 
 bot.command("start", (ctx) =>
@@ -50,6 +107,94 @@ bot.command("ping", (ctx) => {
   const busy = queue.depth;
   return ctx.reply(
     busy > 0 ? `Vivant. ${busy} Reel(s) en cours de traitement.` : "Vivant, et au repos.",
+  );
+});
+
+/**
+ * Goes back over the Reels we commented on and records what the comment collected.
+ *
+ * One scrape each, so it is manual and capped rather than automatic: measuring fifty
+ * comments costs around 0.14 EUR, and there is nothing to learn from re-checking a
+ * comment posted yesterday.
+ */
+bot.command("mesure", async (ctx) => {
+  const brand = config.brand.instagramHandle;
+  if (!brand) {
+    return ctx.reply("BRAND_INSTAGRAM_HANDLE n'est pas defini : impossible de retrouver tes commentaires.");
+  }
+
+  const targets = listToMeasure(MEASURE_BATCH);
+  if (targets.length === 0) {
+    return ctx.reply("Rien a mesurer. Les commentaires de moins de 2 jours sont ignores.");
+  }
+
+  const sent = await ctx.reply(`Mesure de ${targets.length} commentaire(s)...`);
+  let found = 0;
+  let missing = 0;
+  const lines: string[] = [];
+
+  for (const target of targets) {
+    try {
+      const metadata = await queue.add(() => scrapeReel(target.url));
+      const mine = metadata.comments.find((c) => c.author?.toLowerCase() === brand);
+      if (!mine) {
+        // Either not posted, or pushed out of the comments Apify returns.
+        missing++;
+        continue;
+      }
+      const repliesText = mine.replies.map((r) => `@${r.author ?? "?"} : ${r.text}`).join("\n");
+      recordMeasurement(target.shortcode, mine.likeCount, mine.replyCount, repliesText);
+      found++;
+      lines.push(
+        `@${metadata.author ?? "?"} — ${mine.likeCount} like(s), ${mine.replyCount} reponse(s)`,
+      );
+    } catch {
+      missing++;
+    }
+  }
+
+  await ctx.api.deleteMessage(ctx.chat.id, sent.message_id).catch(() => {});
+  await ctx.reply(
+    `<b>${found} mesure(s)</b>${missing ? `, ${missing} introuvable(s)` : ""}\n\n` +
+      (lines.join("\n") || "Aucun de tes commentaires n'a ete retrouve.") +
+      `\n\nCout : ~${(targets.length * 0.0027).toFixed(3)} USD`,
+    { parse_mode: "HTML" },
+  );
+});
+
+/**
+ * The reference library: what actually worked, in your voice.
+ *
+ * Ranked by replies rather than likes. Likes are applause; replies mean someone answered,
+ * which is the only reaction that resembles the point of commenting at all.
+ */
+bot.command("refs", (ctx) => {
+  const refs = listReferences(10);
+  if (refs.length === 0) {
+    return ctx.reply(
+      "Bibliotheque vide. Commente, attends deux jours, puis lance /mesure.",
+    );
+  }
+
+  const blocks = refs.map((r, i) => {
+    const parts = [
+      `<b>${i + 1}. ${r.replies} reponse(s) · ${r.likes} like(s)</b>`,
+      `Createur : @${r.author ?? "?"} · ${r.judgedAt.slice(0, 10)}`,
+      r.cible ? `Audience : ${escapeHtml(r.cible)}` : "",
+      r.douleur ? `Douleur : ${escapeHtml(r.douleur)}` : "",
+      r.angle ? `Angle : ${escapeHtml(r.angle)}` : "",
+      `<code>${escapeHtml(r.comment)}</code>`,
+    ];
+    if (r.repliesText) {
+      parts.push(`<i>Reponses recues :</i>\n${escapeHtml(r.repliesText.slice(0, 300))}`);
+    }
+    return parts.filter(Boolean).join("\n");
+  });
+
+  return ctx.reply(
+    `<b>Tes meilleures interventions</b>\n<i>classees par conversation declenchee, pas par likes</i>\n\n` +
+      blocks.join("\n\n———\n\n"),
+    { parse_mode: "HTML" },
   );
 });
 
@@ -137,10 +282,10 @@ async function handleReelUrl(ctx: TextContext, url: string): Promise<void> {
         ({ audioPath, framePaths } = await extractMedia(videoPath));
       }
 
-      const verdict = await runJudgement(metadata, audioPath, framePaths, status);
+      const { verdict, transcript } = await runJudgement(metadata, audioPath, framePaths, status);
 
       await ctx.api.deleteMessage(ctx.chat.id, sent.message_id).catch(() => {});
-      await sendVerdict(ctx, metadata, verdict);
+      await sendVerdict(ctx, metadata, verdict, transcript);
     });
   } catch (error) {
     await status.fail(error);
@@ -264,10 +409,10 @@ bot.on("message:photo", async (ctx) => {
       status.step("Jugement");
       const transcript = { text: "", language: "inconnue", segments: [] };
       const verdict = await judge(metadata, transcript, [imagePath]);
-      record(metadata.shortcode, metadata.url, metadata.author, verdict);
+      record(metadata.shortcode, metadata.url, metadata.author, verdict, metadata.caption);
 
       await ctx.api.deleteMessage(ctx.chat.id, sent.message_id).catch(() => {});
-      await sendVerdict(ctx, metadata, verdict);
+      await sendVerdict(ctx, metadata, verdict, transcript);
     });
   } catch (error) {
     await status.fail(error);
@@ -295,9 +440,9 @@ bot.on(["message:video", "message:document"], async (ctx) => {
       // A file sent straight to Telegram has no separate audio track, so ffmpeg splits it.
       status.step("Extraction audio et images");
       const { audioPath, framePaths } = await extractMedia(videoPath);
-      const verdict = await runJudgement(metadata, audioPath, framePaths, status);
+      const { verdict, transcript } = await runJudgement(metadata, audioPath, framePaths, status);
       await ctx.api.deleteMessage(ctx.chat.id, sent.message_id).catch(() => {});
-      await sendVerdict(ctx, metadata, verdict);
+      await sendVerdict(ctx, metadata, verdict, transcript);
     });
   } catch (error) {
     await status.fail(error);
@@ -309,21 +454,24 @@ async function runJudgement(
   audioPath: string,
   framePaths: string[],
   status: Status,
-): Promise<Judgement> {
+): Promise<{ verdict: Judgement; transcript: Transcript }> {
   status.step("Transcription");
   const transcript = await transcribe(audioPath);
 
   status.step("Jugement");
   const verdict = await judge(metadata, transcript, framePaths);
 
-  record(metadata.shortcode, metadata.url, metadata.author, verdict);
-  return verdict;
+  record(metadata.shortcode, metadata.url, metadata.author, verdict, metadata.caption);
+  return { verdict, transcript };
 }
 
+// Only `reply` is needed, and every message context exposes it identically — asking for
+// the full text-message context here would reject photos and video files for no reason.
 async function sendVerdict(
-  ctx: { reply: (text: string, other?: object) => Promise<unknown> },
+  ctx: Pick<TextContext, "reply">,
   metadata: ReelMetadata,
   v: Judgement,
+  transcript: Transcript,
 ): Promise<void> {
   const yesNo = (b: boolean) => (b ? "OUI" : "non");
   const header =
@@ -373,17 +521,36 @@ async function sendVerdict(
   // The comment ships as its own message, with nothing around it: it lands last, closest
   // to the thumb, and a single tap on the block copies it with no stray text attached.
   if (v.verdict === "COMMENTER" && v.commentaire) {
-    await ctx.reply(`<code>${escapeHtml(v.commentaire)}</code>`, { parse_mode: "HTML" });
+    const sent = await ctx.reply(`<code>${escapeHtml(v.commentaire)}</code>`, {
+      parse_mode: "HTML",
+      reply_markup: REFINE_KEYBOARD,
+    });
+
+    // Kept in memory so a reformulation can be regenerated in context. Asking for one is
+    // also the only feedback signal we collect: a comment left untouched was good enough.
+    pending.set(sent.message_id, { metadata, transcript, comment: v.commentaire });
+    if (pending.size > PENDING_LIMIT) {
+      pending.delete(pending.keys().next().value!);
+    }
   }
 
   // People in the comments who described the problem themselves are worth more than the
-  // Reel's author: their need is active and stated. One message each, so every reply
-  // stays tap-to-copy.
-  for (const p of v.prospects.slice(0, 3)) {
+  // Reel's author: their need is active and stated.
+  //
+  // Everything goes in one message, each reply its own tap-to-copy block. And every block
+  // opens with the @handle, so these are posted as top-level comments rather than threaded
+  // replies: Instagram notifies the mention just the same, and you never have to hunt for
+  // someone's comment in a section with hundreds of them.
+  const prospects = v.prospects.slice(0, 3);
+  if (prospects.length) {
+    const blocks = prospects.map(
+      (p) =>
+        `<i>${escapeHtml(p.ceQuIlDit)}</i>\n` +
+        `<code>@${escapeHtml(p.pseudo)} ${escapeHtml(p.reponse)}</code>`,
+    );
     await ctx.reply(
-      `Repondre a <b>@${escapeHtml(p.pseudo)}</b>\n` +
-        `<i>${escapeHtml(p.ceQuIlDit)}</i>\n\n` +
-        `<code>${escapeHtml(p.reponse)}</code>`,
+      `<b>${prospects.length} personne${prospects.length > 1 ? "s" : ""} a qui repondre</b>\n\n` +
+        blocks.join("\n\n"),
       { parse_mode: "HTML" },
     );
   }

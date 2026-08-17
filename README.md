@@ -228,6 +228,30 @@ Notes worth knowing:
 |---|---|
 | `/ping` | answers instantly, and says how many Reels are in flight |
 | `/stats` | how many Reels judged today, and how many are worth commenting on |
+| `/mesure` | goes back over your posted comments and records what they collected |
+| `/refs` | your reference library — what actually worked |
+
+Every proposed comment carries three buttons — **Plus court**, **Plus direct**, **Autre
+angle** — that rewrite it under the same brand rules. Asking again chains from the latest
+version rather than looping back to the first.
+
+## The reference library
+
+Measuring is manual and deliberate. `/mesure` re-scrapes the Reels you commented on and
+records the likes and replies your comment collected; `/refs` ranks them.
+
+**Ranked by replies, not by likes.** A comment with 150 likes and no reply is applause. One
+with 30 likes and three replies from people describing their own situation is a
+conversation — and that is the only reaction that resembles the point of commenting at all.
+Replies weigh ten times a like in the ranking.
+
+The output is a library entry per comment: creator, audience, pain, angle, the comment
+itself, and the replies it drew. Paste the best ones into your `context/brand.md` as
+house examples, and the prompt stops leaning on generic rules and starts leaning on what
+worked for you.
+
+This is not machine learning and does not pretend to be. It is a curated shelf of
+references, which needs fifty comments rather than fifty thousand.
 
 Send several links in one message and they queue, two at a time — pacing set by Gemini's
 free-tier limit of roughly ten requests per minute.

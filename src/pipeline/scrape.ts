@@ -52,6 +52,9 @@ export interface ReelComment {
   author: string | null;
   text: string;
   likeCount: number;
+  /** Replies matter more than likes: they mean the comment started something. */
+  replyCount: number;
+  replies: { author: string | null; text: string }[];
 }
 
 /** Pulls the shortcode out of a Reel or post URL, ignoring tracking parameters. */
@@ -93,7 +96,13 @@ export async function scrapeReel(url: string): Promise<ReelMetadata> {
     timestamp?: string;
     commentsCount?: number;
     isCommentsDisabled?: boolean;
-    latestComments?: { ownerUsername?: string; text?: string; likesCount?: number }[];
+    latestComments?: {
+      ownerUsername?: string;
+      text?: string;
+      likesCount?: number;
+      repliesCount?: number;
+      replies?: { ownerUsername?: string; text?: string }[];
+    }[];
     error?: string;
   }[];
 
@@ -121,6 +130,11 @@ export async function scrapeReel(url: string): Promise<ReelMetadata> {
       author: c.ownerUsername ?? null,
       text: (c.text ?? "").trim(),
       likeCount: c.likesCount ?? 0,
+      replyCount: c.repliesCount ?? 0,
+      replies: (c.replies ?? []).map((r) => ({
+        author: r.ownerUsername ?? null,
+        text: (r.text ?? "").trim(),
+      })),
     })),
   };
 }
