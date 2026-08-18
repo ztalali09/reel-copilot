@@ -11,8 +11,12 @@ export interface Judgement {
   score: number;
   like: boolean;
   republier: boolean;
+  /** Fixed vocabulary, so months of judgements can be counted rather than merely read. */
+  sujet: string;
   cible: string;
   douleur: string;
+  /** What holds this audience back, when the Reel reveals it. */
+  objection: string;
   angle: string;
   /** Empty when the verdict is NE_PAS_COMMENTER: no comment is fabricated. */
   commentaire: string;
@@ -36,8 +40,21 @@ const RESPONSE_SCHEMA = {
     score: { type: Type.INTEGER, description: "0-100, pondere selon la grille de scoring" },
     like: { type: Type.BOOLEAN, description: "Liker ce Reel depuis le compte de marque ?" },
     republier: { type: Type.BOOLEAN, description: "Republier en story ?" },
+    sujet: {
+      type: Type.STRING,
+      enum: [
+        "alternance", "stage", "cdi", "premier-emploi", "recherche-emploi", "cv",
+        "lettre-motivation", "entretien", "candidature", "recrutement", "ecole",
+        "formation", "carriere", "ia-outils-emploi", "autre",
+      ],
+      description: "Theme dominant, dans ce vocabulaire ferme",
+    },
     cible: { type: Type.STRING, description: "Qui regarde reellement ce Reel" },
     douleur: { type: Type.STRING, description: "La douleur identifiee, ou 'aucune'" },
+    objection: {
+      type: Type.STRING,
+      description: "Frein exprime ou sous-entendu (peur de payer, du spam, de l'IA...), sinon 'aucune'",
+    },
     angle: { type: Type.STRING, description: "L'angle retenu, ou pourquoi aucun ne tient" },
     commentaire: {
       type: Type.STRING,
@@ -61,7 +78,7 @@ const RESPONSE_SCHEMA = {
     },
   },
   required: [
-    "verdict", "score", "like", "republier", "cible", "douleur",
+    "verdict", "score", "like", "republier", "sujet", "cible", "douleur", "objection",
     "angle", "commentaire", "pourquoi", "risque", "mentionMarque", "prospects",
   ],
 } as const;

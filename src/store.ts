@@ -24,6 +24,19 @@ db.exec(`
     judged_at   TEXT NOT NULL DEFAULT (datetime('now'))
   );
   CREATE INDEX IF NOT EXISTS reels_author_idx ON reels (author, judged_at);
+
+  -- One row per measurement rather than an overwrite. Twelve likes after two hours and
+  -- twelve after ten days are not the same result, and only a series can tell them apart.
+  CREATE TABLE IF NOT EXISTS measurements (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    shortcode      TEXT NOT NULL,
+    likes          INTEGER NOT NULL,
+    replies        INTEGER NOT NULL,
+    replies_text   TEXT,
+    hours_elapsed  REAL,
+    measured_at    TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+  CREATE INDEX IF NOT EXISTS measurements_shortcode_idx ON measurements (shortcode, measured_at);
 `);
 
 // Added after the first deployments, so they go on as migrations rather than in the
@@ -38,6 +51,11 @@ for (const column of [
   "replies INTEGER",
   "replies_text TEXT",
   "measured_at TEXT",
+  // Set when you confirm you actually published the comment.
+  "posted_at TEXT",
+  "sujet TEXT",
+  "persona TEXT",
+  "objection TEXT",
 ]) {
   try {
     db.exec(`ALTER TABLE reels ADD COLUMN ${column}`);
@@ -75,8 +93,8 @@ export function record(
   db.prepare(
     `INSERT OR REPLACE INTO reels
        (shortcode, url, author, verdict, score, liked, reposted, comment,
-        cible, douleur, angle, caption)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        sujet, cible, douleur, objection, angle, caption)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     shortcode,
     url,
@@ -86,8 +104,10 @@ export function record(
     judgement.like ? 1 : 0,
     judgement.republier ? 1 : 0,
     judgement.commentaire,
+    judgement.sujet,
     judgement.cible,
     judgement.douleur,
+    judgement.objection,
     judgement.angle,
     caption,
   );
@@ -123,17 +143,83 @@ export function listToMeasure(limit = 25): CommentedReel[] {
     .all(limit) as CommentedReel[];
 }
 
+export interface MeasurementDelta {
+  likes: number;
+  replies: number;
+  /** Change since the previous measurement, null on the first one. */
+  likesDelta: number | null;
+  repliesDelta: number | null;
+  /** Hours between publication and this reading — the number that gives the rest meaning. */
+  hoursElapsed: number | null;
+}
+
+/**
+ * Appends a reading and returns how it moved since the last one.
+ *
+ * Elapsed time is counted from `posted_at` when you confirmed publishing, otherwise from
+ * the judgement. Without it a like count is unreadable: fast traction and slow decay
+ * produce the same number.
+ */
 export function recordMeasurement(
   shortcode: string,
   likes: number,
   replies: number,
   repliesText: string,
-): void {
+): MeasurementDelta {
+  const previous = db
+    .prepare(
+      `SELECT likes, replies FROM measurements
+       WHERE shortcode = ? ORDER BY measured_at DESC LIMIT 1`,
+    )
+    .get(shortcode) as { likes: number; replies: number } | undefined;
+
+  const elapsed = db
+    .prepare(
+      `SELECT (julianday('now') - julianday(COALESCE(posted_at, judged_at))) * 24 AS hours
+       FROM reels WHERE shortcode = ?`,
+    )
+    .get(shortcode) as { hours: number | null } | undefined;
+  const hoursElapsed = elapsed?.hours ?? null;
+
+  db.prepare(
+    `INSERT INTO measurements (shortcode, likes, replies, replies_text, hours_elapsed)
+     VALUES (?, ?, ?, ?, ?)`,
+  ).run(shortcode, likes, replies, repliesText, hoursElapsed);
+
+  // Mirrored on the reel row so ranking stays a single cheap query.
   db.prepare(
     `UPDATE reels
      SET likes = ?, replies = ?, replies_text = ?, measured_at = datetime('now')
      WHERE shortcode = ?`,
   ).run(likes, replies, repliesText, shortcode);
+
+  return {
+    likes,
+    replies,
+    likesDelta: previous ? likes - previous.likes : null,
+    repliesDelta: previous ? replies - previous.replies : null,
+    hoursElapsed,
+  };
+}
+
+/** Full reading history for one comment, oldest first. */
+export function measurementHistory(shortcode: string): {
+  likes: number;
+  replies: number;
+  hoursElapsed: number | null;
+  measuredAt: string;
+}[] {
+  return db
+    .prepare(
+      `SELECT likes, replies, hours_elapsed AS hoursElapsed, measured_at AS measuredAt
+       FROM measurements WHERE shortcode = ? ORDER BY measured_at ASC`,
+    )
+    .all(shortcode) as {
+    likes: number;
+    replies: number;
+    hoursElapsed: number | null;
+    measuredAt: string;
+  }[];
 }
 
 export interface Reference {
@@ -189,6 +275,40 @@ export function commentsForAuthorToday(author: string | null): number {
     )
     .get(author) as { n: number };
   return row.n;
+}
+
+/** Marks a comment as actually published, and returns the running count for today. */
+export function markPosted(shortcode: string, comment: string): number {
+  db.prepare(
+    `UPDATE reels SET posted_at = datetime('now'), comment = ? WHERE shortcode = ?`,
+  ).run(comment, shortcode);
+  return postedToday();
+}
+
+export function postedToday(): number {
+  const row = db
+    .prepare(`SELECT COUNT(*) AS n FROM reels WHERE date(posted_at) = date('now')`)
+    .get() as { n: number };
+  return row.n;
+}
+
+export function isPosted(shortcode: string): boolean {
+  const row = db.prepare(`SELECT posted_at FROM reels WHERE shortcode = ?`).get(shortcode) as
+    | { posted_at: string | null }
+    | undefined;
+  return Boolean(row?.posted_at);
+}
+
+/** Publications per day over the last `days` days, most recent first. */
+export function postedHistory(days = 7): { day: string; count: number }[] {
+  return db
+    .prepare(
+      `SELECT date(posted_at) AS day, COUNT(*) AS count
+       FROM reels
+       WHERE posted_at IS NOT NULL AND julianday('now') - julianday(posted_at) < ?
+       GROUP BY day ORDER BY day DESC`,
+    )
+    .all(days) as { day: string; count: number }[];
 }
 
 /** Today's counters, to keep the daily cadence honest. */

@@ -23,6 +23,9 @@ import {
   findJudged,
   listReferences,
   listToMeasure,
+  markPosted,
+  postedHistory,
+  postedToday,
   record,
   recordMeasurement,
   todayStats,
@@ -40,7 +43,13 @@ const EDIT_THROTTLE_MS = 3_000;
 // Each measurement is one scrape, so cap a manual run rather than sweeping everything.
 const MEASURE_BATCH = 15;
 
+// A ceiling, not a quota. The counter exists so you can stop with a clear head, not so
+// you chase a number: a day at twelve good comments beats one padded to twenty.
+const DAILY_CEILING = 20;
+
 const REFINE_KEYBOARD = new InlineKeyboard()
+  .text("Poste", "posted")
+  .row()
   .text("Plus court", "refine:court")
   .text("Plus direct", "refine:direct")
   .row()
@@ -53,7 +62,10 @@ const REFINE_INSTRUCTIONS: Record<string, string> = {
 };
 
 /** Context of recently proposed comments, so a reformulation can be regenerated. */
-const pending = new Map<number, { metadata: ReelMetadata; transcript: Transcript; comment: string }>();
+const pending = new Map<
+  number,
+  { metadata: ReelMetadata; transcript: Transcript; comment: string }
+>();
 const PENDING_LIMIT = 200;
 
 type TextContext = Filter<Context, "message:text">;
@@ -62,6 +74,32 @@ type TextContext = Filter<Context, "message:text">;
 bot.use(async (ctx, next) => {
   if (ctx.from?.id !== config.telegram.ownerId) return;
   await next();
+});
+
+bot.callbackQuery("posted", async (ctx) => {
+  const messageId = ctx.callbackQuery.message?.message_id;
+  const context = messageId ? pending.get(messageId) : undefined;
+  if (!context) {
+    return ctx.answerCallbackQuery("Ce commentaire est trop ancien, renvoie le Reel.");
+  }
+
+  // The comment stored may be an earlier draft if you asked for rewrites, so save the
+  // version actually on screen — that is the one that got published.
+  const count = markPosted(context.metadata.shortcode, context.comment);
+  const left = DAILY_CEILING - count;
+
+  await ctx.answerCallbackQuery(
+    left > 0 ? `${count}/${DAILY_CEILING} — encore ${left}` : `${count}/${DAILY_CEILING} — c'est bon`,
+  );
+
+  // Drop the buttons so a comment cannot be counted twice.
+  await ctx.editMessageReplyMarkup({ reply_markup: undefined }).catch(() => {});
+  await ctx.reply(
+    left > 0
+      ? `Publie. <b>${count}/${DAILY_CEILING}</b> aujourd'hui.`
+      : `Publie. <b>${count}/${DAILY_CEILING}</b> — objectif du jour atteint.`,
+    { parse_mode: "HTML" },
+  );
 });
 
 bot.callbackQuery(/^refine:(.+)$/, async (ctx) => {
@@ -143,10 +181,21 @@ bot.command("mesure", async (ctx) => {
         continue;
       }
       const repliesText = mine.replies.map((r) => `@${r.author ?? "?"} : ${r.text}`).join("\n");
-      recordMeasurement(target.shortcode, mine.likeCount, mine.replyCount, repliesText);
+      const d = recordMeasurement(target.shortcode, mine.likeCount, mine.replyCount, repliesText);
       found++;
+
+      const age =
+        d.hoursElapsed === null
+          ? ""
+          : d.hoursElapsed < 48
+            ? ` · ${Math.round(d.hoursElapsed)} h`
+            : ` · ${Math.round(d.hoursElapsed / 24)} j`;
+      const delta = (value: number, change: number | null) =>
+        change === null ? `${value}` : `${value} (${change >= 0 ? "+" : ""}${change})`;
+
       lines.push(
-        `@${metadata.author ?? "?"} — ${mine.likeCount} like(s), ${mine.replyCount} reponse(s)`,
+        `@${metadata.author ?? "?"}${age} — ${delta(d.likes, d.likesDelta)} like(s), ` +
+          `${delta(d.replies, d.repliesDelta)} reponse(s)`,
       );
     } catch {
       missing++;
@@ -200,8 +249,20 @@ bot.command("refs", (ctx) => {
 
 bot.command("stats", (ctx) => {
   const { judged, toComment } = todayStats();
+  const posted = postedToday();
+  const bar = "█".repeat(posted) + "·".repeat(Math.max(0, DAILY_CEILING - posted));
+  const history = postedHistory(7)
+    .slice(1)
+    .map((d) => `${d.day.slice(5)} : ${d.count}`)
+    .join("  ·  ");
+
   return ctx.reply(
-    `Aujourd'hui : ${judged} Reels analyses, ${toComment} qui meritent un commentaire.`,
+    `<b>Publies aujourd'hui : ${posted}/${DAILY_CEILING}</b>\n` +
+      `<code>${bar}</code>\n\n` +
+      `${judged} Reels analyses, ${toComment} juges dignes d'un commentaire.\n` +
+      (history ? `\n<i>Jours precedents</i>\n${history}` : "") +
+      `\n\n<i>${DAILY_CEILING} est un plafond, pas un quota : douze bons commentaires valent mieux que vingt remplis pour le chiffre.</i>`,
+    { parse_mode: "HTML" },
   );
 });
 
