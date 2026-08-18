@@ -2,6 +2,7 @@ import Database from "better-sqlite3";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import type { Judgement } from "./pipeline/judge.js";
+import type { ReelMetadata } from "./pipeline/scrape.js";
 
 // Hosted, this points at a mounted volume: without one, every redeploy wipes the history
 // and the bot starts re-judging Reels it has already seen.
@@ -34,6 +35,11 @@ db.exec(`
     replies        INTEGER NOT NULL,
     replies_text   TEXT,
     hours_elapsed  REAL,
+    -- The Reel's own trajectory. A comment flat while the Reel tripled its views means
+    -- something different from a comment flat on a Reel that never moved.
+    reel_views     INTEGER,
+    reel_likes     INTEGER,
+    reel_comments  INTEGER,
     measured_at    TEXT NOT NULL DEFAULT (datetime('now'))
   );
   CREATE INDEX IF NOT EXISTS measurements_shortcode_idx ON measurements (shortcode, measured_at);
@@ -56,6 +62,23 @@ for (const column of [
   "sujet TEXT",
   "persona TEXT",
   "objection TEXT",
+  // Everything the pipeline paid to obtain. Scraping and transcribing cost money and
+  // cannot be replayed once a Reel is edited or deleted, so nothing gets discarded.
+  "transcript TEXT",
+  "transcript_lang TEXT",
+  "hashtags TEXT",
+  "view_count INTEGER",
+  "reel_like_count INTEGER",
+  "reel_comment_count INTEGER",
+  "published_at TEXT",
+  "duration_seconds REAL",
+  "pourquoi TEXT",
+  "risque TEXT",
+  "mention_marque INTEGER",
+  "prospects_json TEXT",
+  "observed_comments_json TEXT",
+  // Your own remarks. The one thing the model cannot produce, and the one that ages best.
+  "notes TEXT",
 ]) {
   try {
     db.exec(`ALTER TABLE reels ADD COLUMN ${column}`);
@@ -83,22 +106,32 @@ export function findJudged(shortcode: string): PastJudgement | null {
   return row ?? null;
 }
 
+/**
+ * Stores everything the pipeline produced for one Reel.
+ *
+ * Deliberately exhaustive. A scrape and a transcription cost money, and neither can be
+ * replayed later: the Reel may be edited, its comments will have moved on, and the
+ * transcript would have to be paid for again. Whatever was obtained is kept, even the
+ * fields nothing reads yet.
+ */
 export function record(
-  shortcode: string,
-  url: string,
-  author: string | null,
+  metadata: ReelMetadata,
   judgement: Judgement,
-  caption = "",
+  transcript?: { text: string; language: string },
 ): void {
   db.prepare(
     `INSERT OR REPLACE INTO reels
        (shortcode, url, author, verdict, score, liked, reposted, comment,
-        sujet, cible, douleur, objection, angle, caption)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        sujet, cible, douleur, objection, angle, caption,
+        transcript, transcript_lang, hashtags, view_count, reel_like_count,
+        reel_comment_count, published_at, duration_seconds,
+        pourquoi, risque, mention_marque, prospects_json, observed_comments_json)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+             ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
-    shortcode,
-    url,
-    author,
+    metadata.shortcode,
+    metadata.url,
+    metadata.author,
     judgement.verdict,
     judgement.score,
     judgement.like ? 1 : 0,
@@ -109,7 +142,20 @@ export function record(
     judgement.douleur,
     judgement.objection,
     judgement.angle,
-    caption,
+    metadata.caption,
+    transcript?.text ?? null,
+    transcript?.language ?? null,
+    JSON.stringify(metadata.hashtags),
+    metadata.viewCount,
+    metadata.likeCount,
+    metadata.commentCount,
+    metadata.postedAt,
+    metadata.durationSeconds,
+    judgement.pourquoi,
+    judgement.risque,
+    judgement.mentionMarque ? 1 : 0,
+    JSON.stringify(judgement.prospects),
+    JSON.stringify(metadata.comments),
   );
 }
 
@@ -165,6 +211,7 @@ export function recordMeasurement(
   likes: number,
   replies: number,
   repliesText: string,
+  reel?: { views: number | null; likes: number | null; comments: number | null },
 ): MeasurementDelta {
   const previous = db
     .prepare(
@@ -182,9 +229,14 @@ export function recordMeasurement(
   const hoursElapsed = elapsed?.hours ?? null;
 
   db.prepare(
-    `INSERT INTO measurements (shortcode, likes, replies, replies_text, hours_elapsed)
-     VALUES (?, ?, ?, ?, ?)`,
-  ).run(shortcode, likes, replies, repliesText, hoursElapsed);
+    `INSERT INTO measurements
+       (shortcode, likes, replies, replies_text, hours_elapsed,
+        reel_views, reel_likes, reel_comments)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    shortcode, likes, replies, repliesText, hoursElapsed,
+    reel?.views ?? null, reel?.likes ?? null, reel?.comments ?? null,
+  );
 
   // Mirrored on the reel row so ranking stays a single cheap query.
   db.prepare(
@@ -309,6 +361,50 @@ export function postedHistory(days = 7): { day: string; count: number }[] {
        GROUP BY day ORDER BY day DESC`,
     )
     .all(days) as { day: string; count: number }[];
+}
+
+/**
+ * The comments we recently proposed, to forbid repeating them.
+ *
+ * Fighting repetition through prompt instructions alone does not work: the model keeps
+ * reaching for the same phrasing, and for the examples in the brand brief. Showing it
+ * what has already been said is the only reliable way to make it find something else.
+ */
+export function recentComments(limit = 25): string[] {
+  return (
+    db
+      .prepare(
+        `SELECT comment FROM reels
+         WHERE comment <> '' ORDER BY judged_at DESC LIMIT ?`,
+      )
+      .all(limit) as { comment: string }[]
+  ).map((r) => r.comment);
+}
+
+/**
+ * Appends a remark to the most recently judged Reel, or to a given one.
+ *
+ * Notes are timestamped and never overwritten: an opinion formed today and one formed
+ * three weeks later are both worth keeping, and the disagreement between them is the
+ * interesting part.
+ */
+export function addNote(text: string, shortcode?: string): string | null {
+  const target =
+    shortcode ??
+    (
+      db.prepare(`SELECT shortcode FROM reels ORDER BY judged_at DESC LIMIT 1`).get() as
+        | { shortcode: string }
+        | undefined
+    )?.shortcode;
+  if (!target) return null;
+
+  const stamped = `[${new Date().toISOString().slice(0, 16).replace("T", " ")}] ${text}`;
+  db.prepare(
+    `UPDATE reels
+     SET notes = CASE WHEN notes IS NULL OR notes = '' THEN ? ELSE notes || char(10) || ? END
+     WHERE shortcode = ?`,
+  ).run(stamped, stamped, target);
+  return target;
 }
 
 /** Today's counters, to keep the daily cadence honest. */

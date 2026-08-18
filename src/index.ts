@@ -25,7 +25,9 @@ import {
   listToMeasure,
   markPosted,
   postedHistory,
+  addNote,
   postedToday,
+  recentComments,
   record,
   recordMeasurement,
   todayStats,
@@ -47,13 +49,15 @@ const MEASURE_BATCH = 15;
 // you chase a number: a day at twelve good comments beats one padded to twenty.
 const DAILY_CEILING = 20;
 
+// Rewrites first, publication last: that is the order the hand goes in, and putting the
+// final action at the bottom keeps it from being tapped before the comment is settled.
 const REFINE_KEYBOARD = new InlineKeyboard()
-  .text("Poste", "posted")
-  .row()
   .text("Plus court", "refine:court")
   .text("Plus direct", "refine:direct")
   .row()
-  .text("Autre angle", "refine:angle");
+  .text("Autre angle", "refine:angle")
+  .row()
+  .text("✓ Je l'ai poste", "posted");
 
 const REFINE_INSTRUCTIONS: Record<string, string> = {
   court: "raccourcis-le nettement, garde l'idee mais coupe tout ce qui n'est pas essentiel",
@@ -181,7 +185,11 @@ bot.command("mesure", async (ctx) => {
         continue;
       }
       const repliesText = mine.replies.map((r) => `@${r.author ?? "?"} : ${r.text}`).join("\n");
-      const d = recordMeasurement(target.shortcode, mine.likeCount, mine.replyCount, repliesText);
+      const d = recordMeasurement(target.shortcode, mine.likeCount, mine.replyCount, repliesText, {
+        views: metadata.viewCount,
+        likes: metadata.likeCount,
+        comments: metadata.commentCount,
+      });
       found++;
 
       const age =
@@ -245,6 +253,22 @@ bot.command("refs", (ctx) => {
       blocks.join("\n\n———\n\n"),
     { parse_mode: "HTML" },
   );
+});
+
+/**
+ * Attaches a remark to the last judged Reel.
+ *
+ * The model can produce an angle; it cannot tell you that a comment felt forced, or that
+ * a creator's audience turned out to be Belgian. That judgement is yours, it fades within
+ * a day, and nothing else in the system captures it.
+ */
+bot.command("note", (ctx) => {
+  const text = ctx.match?.trim();
+  if (!text) {
+    return ctx.reply("Ecris ta remarque apres la commande : /note le commentaire sonnait force");
+  }
+  const target = addNote(text);
+  return ctx.reply(target ? `Note ajoutee sur ${target}.` : "Aucun Reel a annoter pour l'instant.");
 });
 
 bot.command("stats", (ctx) => {
@@ -469,8 +493,8 @@ bot.on("message:photo", async (ctx) => {
     await queue.add(async () => {
       status.step("Jugement");
       const transcript = { text: "", language: "inconnue", segments: [] };
-      const verdict = await judge(metadata, transcript, [imagePath]);
-      record(metadata.shortcode, metadata.url, metadata.author, verdict, metadata.caption);
+      const verdict = await judge(metadata, transcript, [imagePath], recentComments());
+      record(metadata, verdict, transcript);
 
       await ctx.api.deleteMessage(ctx.chat.id, sent.message_id).catch(() => {});
       await sendVerdict(ctx, metadata, verdict, transcript);
@@ -520,9 +544,9 @@ async function runJudgement(
   const transcript = await transcribe(audioPath);
 
   status.step("Jugement");
-  const verdict = await judge(metadata, transcript, framePaths);
+  const verdict = await judge(metadata, transcript, framePaths, recentComments());
 
-  record(metadata.shortcode, metadata.url, metadata.author, verdict, metadata.caption);
+  record(metadata, verdict, transcript);
   return { verdict, transcript };
 }
 

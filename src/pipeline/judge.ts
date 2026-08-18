@@ -4,6 +4,9 @@ import { config } from "../config.js";
 import { ageInHours, commentDensity, type ReelMetadata } from "./scrape.js";
 import type { Transcript } from "./transcribe.js";
 
+// Below this, the Reel is off-target: no like, whatever the model proposed.
+const LIKE_FLOOR = 55;
+
 const BRAND_CONTEXT_PATH = new URL("../../context/brand.md", import.meta.url);
 
 export interface Judgement {
@@ -322,6 +325,7 @@ export async function judge(
   metadata: ReelMetadata,
   transcript: Transcript,
   framePaths: string[],
+  alreadyUsed: string[] = [],
 ): Promise<Judgement> {
   const ai = new GoogleGenAI({ apiKey: config.gemini.apiKey });
   const brand = await loadBrandContext();
@@ -372,6 +376,17 @@ export async function judge(
         parts: [
           { text: brand },
           { text: INSTRUCTIONS },
+          ...(alreadyUsed.length
+            ? [
+                {
+                  text:
+                    "COMMENTAIRES DEJA PROPOSES PAR LE PASSE — n'en reproduis aucun, et " +
+                    "n'en produis pas de variante proche. Si ton idee ressemble a l'un " +
+                    "d'eux, c'est que tu pioches au lieu d'observer ce Reel-ci :\n" +
+                    alreadyUsed.map((c) => `- ${c}`).join("\n"),
+                },
+              ]
+            : []),
           { text: reelBrief },
           // Frames last: a lot of Reels carry their real message in burned-in text.
           { text: "IMAGES EXTRAITES DU REEL :" },
@@ -394,6 +409,11 @@ export async function judge(
 
   // The schema cannot express "empty comment when refusing", so enforce it here.
   if (parsed.verdict === "NE_PAS_COMMENTER") parsed.commentaire = "";
+
+  // Measured in production: the model liked 18 of its 30 refusals, including Reels it had
+  // just scored 45/100 as off-target. Judging something irrelevant and endorsing it anyway
+  // is incoherent, and the prompt rule alone did not hold — so it is enforced here.
+  if (parsed.score < LIKE_FLOOR) parsed.like = false;
 
   // The handle is prepended when the message is built. The model keeps writing it anyway,
   // which would produce "@manon_rh manon_rh : ..." — strip it rather than fight the prompt.
