@@ -7,6 +7,15 @@ import type { Transcript } from "./transcribe.js";
 // Below this, the Reel is off-target: no like, whatever the model proposed.
 const LIKE_FLOOR = 55;
 
+// Visibility ceilings by age. Past two days a comment section has settled and a new
+// comment lands at the bottom; past a week it is simply not read. These are arithmetic,
+// not judgement, so they are applied here — the prompt states them too, but the rule
+// dilutes as instructions accumulate and a 6-day Reel came back scored 90.
+const AGE_CEILINGS: [hours: number, ceiling: number][] = [
+  [24 * 7, 45],
+  [48, 65],
+];
+
 const BRAND_CONTEXT_PATH = new URL("../../context/brand.md", import.meta.url);
 
 export interface Judgement {
@@ -91,6 +100,16 @@ Tu appliques le contexte de marque ci-dessus a UN Reel Instagram.
 
 Ta sortie n'est pas une suggestion : elle est copiee-collee telle quelle par un humain qui
 publiera depuis le compte de la marque. Ecris donc le commentaire final, pas un brouillon.
+
+REGLE ELIMINATOIRE — a verifier avant tout le reste
+
+L'audience du Reel vit-elle en France ? Si le contenu s'adresse a un autre marche
+(salaires en dollars, villes etrangeres, entreprises ou pratiques d'un autre pays,
+plateformes non utilisees en France), le Reel est HORS CIBLE quelle que soit la qualite
+du sujet : score maximum 45, verdict NE_PAS_COMMENTER. La langue ne suffit pas a trancher
+dans un sens comme dans l'autre — un contenu en anglais peut viser des Francais, un
+contenu en francais peut viser le Quebec ou la Belgique. Cherche les indices de lieu, de
+monnaie, d'institutions et de systeme scolaire.
 
 REGLES DE DECISION
 
@@ -201,10 +220,25 @@ CAS QUI DEMANDENT UNE RETENUE PARTICULIERE
   trouvee, entretien decroche), on felicite sobrement ou on se tait. Placer un angle
   produit sur la reussite de quelqu'un est le comportement de la marque qui recupere
   tout, et ca se voit immediatement. Dans le doute : NE_PAS_COMMENTER.
-- CONTENU HOSTILE A LA CATEGORIE. Quand un Reel critique les outils d'automatisation de
-  candidature, tout commentaire de notre part se lit comme de l'auto-defense, meme
-  nuance. Le gain est faible et le risque eleve : refuse, sauf si tu peux repondre sans
-  jamais defendre l'outillage.
+- CONTENU HOSTILE A LA CATEGORIE. Quand un Reel critique les outils de candidature
+  automatises, ne tranche pas mecaniquement : analyse d'abord CE QUI est reproche.
+
+  a) Le Reel critique LE VOLUME, le spam, les lettres generiques, les candidatures
+     envoyees sans lire l'entreprise ? Alors la marque est D'ACCORD, et c'est meme son
+     terrain. Tu peux commenter — a une condition absolue : ABONDER dans le sens de la
+     critique, JAMAIS defendre l'outillage. Une phrase qui commence par "oui mais avec
+     le bon outil" ou "quand on garde le controle" est une defense deguisee : elle
+     signale que tu te sens vise, et elle te range dans le camp attaque. Le commentaire
+     doit pouvoir etre lu par quelqu'un qui ignore l'existence de la marque sans jamais
+     laisser deviner qu'elle vend un outil.
+  b) Le Reel critique le PRINCIPE meme d'utiliser un logiciel ou l'IA pour candidater ?
+     Il n'existe alors aucune facon d'intervenir sans se defendre. NE_PAS_COMMENTER.
+  c) Le Reel vise nommement un concurrent ou raconte une mauvaise experience precise ?
+     NE_PAS_COMMENTER. Enfoncer un concurrent est interdit, et s'en distinguer revient
+     a se presenter, donc a faire de la publicite sur le malheur d'un autre.
+
+  Dans tous les cas, mets 'risque' a moyen au minimum, et dis explicitement dans
+  'pourquoi' laquelle de ces trois situations tu as reconnue.
 - SUJET JURIDIQUE. Rester factuel ou se taire. Jamais d'interpretation.
 
 LE LIKE N'EST PAS GRATUIT
@@ -397,8 +431,8 @@ export async function judge(
     config: {
       responseMimeType: "application/json",
       responseSchema: RESPONSE_SCHEMA,
-      // The judgement should be stable: the same Reel twice should not flip verdicts.
-      temperature: 0.4,
+      // The judgement must be stable: the same Reel twice should not flip verdicts.
+      temperature: 0.25,
     },
   });
 
@@ -413,6 +447,17 @@ export async function judge(
   // Measured in production: the model liked 18 of its 30 refusals, including Reels it had
   // just scored 45/100 as off-target. Judging something irrelevant and endorsing it anyway
   // is incoherent, and the prompt rule alone did not hold — so it is enforced here.
+  const ageHours = ageInHours(metadata);
+  if (ageHours !== null) {
+    for (const [hours, ceiling] of AGE_CEILINGS) {
+      if (ageHours > hours && parsed.score > ceiling) {
+        parsed.score = ceiling;
+        parsed.pourquoi = `${parsed.pourquoi} (score plafonne : Reel publie il y a ${Math.round(ageHours / 24)} jours)`;
+        break;
+      }
+    }
+  }
+
   if (parsed.score < LIKE_FLOOR) parsed.like = false;
 
   // The handle is prepended when the message is built. The model keeps writing it anyway,
